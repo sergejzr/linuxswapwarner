@@ -1,105 +1,118 @@
-#!/bin/bash
+#!/usr/bin/env bash
+set -u
 
-
-#=============User Variables START===================
-#Grafic progressbar should work everywhere with zenity
+#============= User Variables START ===================
 GPROGRESS=1
-
-#What is the lowest percentage of free swap to alert for
 threshold=20
+check_interval=10
+cooldown=300   # seconds between alerts
 
-#What should happen if user agrees to clean swap?
-function killOnDemand {
-    echo "Kill Chrome"
-    killall -9 chrome
+kill_on_demand() {
+    echo "Closing Chrome gracefully..."
+    pkill -TERM -x chrome 2>/dev/null || true
+    pkill -TERM -x google-chrome 2>/dev/null || true
+    pkill -TERM -x chromium 2>/dev/null || true
+    sleep 5
+
+    echo "Force killing remaining Chrome processes..."
+    pkill -KILL -x chrome 2>/dev/null || true
+    pkill -KILL -x google-chrome 2>/dev/null || true
+    pkill -KILL -x chromium 2>/dev/null || true
+}
+#============= User Variables END =====================
+
+progress_bar() {
+    local current=$1
+    local total=$2
+    local progress done left fill empty
+
+    (( total > 0 )) || return 1
+
+    progress=$(( current * 100 / total ))
+    done=$(( progress * 40 / 100 ))
+    left=$(( 40 - done ))
+
+    fill=$(printf "%${done}s")
+    empty=$(printf "%${left}s")
+    printf "\rProgress : [%s%s] %d%%" "${fill// /#}" "${empty// /-}" "$progress"
 }
 
-#=============User Variables END===================
+get_swap_values() {
+    local total free
+    while read -r key value _; do
+        case "$key" in
+            SwapTotal:) total=$value ;;
+            SwapFree:)  free=$value ;;
+        esac
+    done < /proc/meminfo
 
-
-
-
-
-# Shel based progress bar
-function ProgressBar {
-# Process data
-    let _progress=(${1}*100/${2}*100)/100
-    let _done=(${_progress}*4)/10
-    let _left=40-$_done
-# Build progressbar string lengths
-    _fill=$(printf "%${_done}s")
-    _empty=$(printf "%${_left}s")
-
-# 1.2 Build progressbar strings and print the ProgressBar line
-# 1.2.1 Output example:                           
-# 1.2.1.1 Progress : [########################################] 100%
-    printf "\rProgress : [${_fill// /#}${_empty// /-}] ${_progress}%%"
-
+    echo "${total:-0} ${free:-0}"
 }
 
+last_alert=0
 
-
-#START Logic
 while true; do
+    read -r swap_total swap_free < <(get_swap_values)
 
-#Calculate free swap percentage 
-swapfree=$(sed -n '/SwapFree/s/[^[:digit:]]*\([[:digit:]]*\).*/\1/p' /proc/meminfo)
-
-swapall=$(sed -n '/SwapTotal/s/[^[:digit:]]*\([[:digit:]]*\).*/\1/p' /proc/meminfo)
-
-freeperc=$(( $swapfree * 100 / $swapall ))
-
-
-
-if [[ $freeperc -lt $threshold ]] ; then
-    notify-send 'title' 'Swap critical! Clean-Dialog will popup now'
-    $(zenity --question --text="Swap critical ($freeperc %) ! Kill defined apps and free swap?")
-
-    if [[ $? -eq 0 ]]; then
-    
-        killOnDemand
-    
-        echo "Swap Off-Signal"
-        sudo swapoff -a 
-        echo "Wait of OS to free swap"
-        if [[ $GPROGRESS -eq 0 ]]; then
-            # Variables
-            _start=1
-
-            # This accounts as the "totalState" variable for the ProgressBar function
-            _end=400
-
-            # Proof of concept
-            for number in $(seq ${_start} ${_end})
-            do
-                sleep 0.1
-                ProgressBar ${number} ${_end}
-            done
-        printf '\nFinished!\n'
-
-        elif [[ $GPROGRESS -eq 1 ]]; then
-    
-            ( 
-            echo "10"; sleep 3
-            echo "20"; sleep 3
-            echo "30"; sleep 3
-            echo "40"; sleep 3
-            echo "50"; sleep 3
-            echo "60"; sleep 3
-            echo "70"; sleep 3
-            echo "80"; sleep 3
-            echo "90"; sleep 3
-            echo "100"; sleep 3
-            )  | zenity --progress --auto-close --auto-kill --title="Wait of OS to free swap" --percentage=0
-    
-        fi
-
-        #sudo swapon -a 
-        echo "Swap cleaned"
-
-    elif [[ $? -eq 1 ]]; then
-        echo "Cancel"
+    if (( swap_total == 0 )); then
+        echo "No swap configured; sleeping."
+        sleep "$check_interval"
+        continue
     fi
-fi
-sleep 10
+
+    freeperc=$(( swap_free * 100 / swap_total ))
+
+    if (( freeperc < threshold )); then
+        now=$(date +%s)
+        if (( now - last_alert < cooldown )); then
+            sleep "$check_interval"
+            continue
+        fi
+        last_alert=$now
+
+        notify-send "Swap critical" "Free swap is at ${freeperc}%."
+
+        if zenity --question \
+            --title="Low swap" \
+            --text="Swap critical (${freeperc}% free). Kill configured apps and clean swap?"; then
+
+            kill_on_demand
+
+            if ! sudo -n true 2>/dev/null; then
+                notify-send "Swap cleanup failed" "sudo requires a password."
+                echo "sudo requires password; cannot run swapoff/swapon non-interactively."
+                sleep "$check_interval"
+                continue
+            fi
+
+            echo "Turning swap off..."
+            if (( GPROGRESS == 0 )); then
+                sudo swapoff -a && sudo swapon -a
+                echo "Swap cleaned."
+            else
+                (
+                    echo "10"
+                    echo "# Turning swap off..."
+                    sudo swapoff -a || exit 1
+
+                    echo "70"
+                    echo "# Turning swap on..."
+                    sudo swapon -a || exit 1
+
+                    echo "100"
+                    echo "# Done"
+                ) | zenity --progress \
+                    --title="Cleaning swap" \
+                    --percentage=0 \
+                    --auto-close \
+                    --auto-kill
+            fi
+
+            notify-send "Swap cleaned" "Swap was cycled successfully."
+        else
+            echo "User cancelled."
+        fi
+    fi
+
+    sleep "$check_interval"
 done
